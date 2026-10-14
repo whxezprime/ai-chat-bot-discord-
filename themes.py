@@ -1,4 +1,3 @@
-cd ~/ai-chat-bot-discord- && cat > themes.py << 'THEMES_EOF'
 THEMES = {
     "editor": {
         "name": "🎬 Edit Master",
@@ -54,5 +53,3 @@ def get_theme(theme_key: str = None) -> dict:
     if key not in THEMES:
         raise ValueError(f"Theme '{key}' không tồn tại. Có sẵn: {list(THEMES.keys())}")
     return THEMES[key]
-THEMES_EOF
-echo "✅ Đã tạo themes.py"
