@@ -564,4 +564,14 @@ async def on_ready():
 # ============================================================
 try:
     from werewolf import setup_werewolf
-    setup_werewolf(bot
+    setup_werewolf(bot)
+    print("✅ Đã load game Ma Sói.")
+except ImportError:
+    print("⚠️ Không tìm thấy werewolf.py — bỏ qua game Ma Sói.")
+
+
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
