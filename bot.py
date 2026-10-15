@@ -12,15 +12,15 @@ from themes import get_theme, THEMES, ACTIVE_THEME
 
 # ===== Config =====
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = "llama-3.3-70b-versatile"  # model mạnh, nhanh, hỗ trợ tiếng Việt tốt
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 ONLY_CONFIG_FILE = "only_config.json"
 
 if not DISCORD_TOKEN:
     raise SystemExit("❌ Chưa set DISCORD_TOKEN")
-if not GEMINI_API_KEY:
-    raise SystemExit("❌ Chưa set GEMINI_API_KEY")
+if not GROQ_API_KEY:
+    raise SystemExit("❌ Chưa set GROQ_API_KEY")
 
 
 # ============================================================
@@ -37,10 +37,7 @@ BAD_WORDS = [
     "dick", "pussy", "cunt", "bastard", "motherfucker",
 ]
 
-BYPASS_MAP = {
-    '@': 'a', '0': 'o', '1': 'i', '3': 'e',
-    '4': 'a', '5': 's', '7': 't', '$': 's',
-}
+BYPASS_MAP = {'@': 'a', '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '$': 's'}
 
 MAX_VIOLATIONS = 3
 BAN_DURATION = 600
@@ -89,20 +86,13 @@ def record_violation(user_id: int):
 def format_warning(user_mention: str, count: int, banned: bool) -> str:
     if banned:
         mins = BAN_DURATION // 60
-        return (
-            f"🚫 **{user_mention}** đã vi phạm **{MAX_VIOLATIONS} lần** "
-            f"và bị tạm chặn **{mins} phút**. Hãy giữ văn minh nhé!"
-        )
-    return (
-        f"⚠️ **{user_mention}** ơi, đừng dùng từ ngữ không phù hợp nhé! "
-        f"*(Lần {count}/{MAX_VIOLATIONS})*"
-    )
+        return f"🚫 **{user_mention}** đã vi phạm **{MAX_VIOLATIONS} lần** và bị tạm chặn **{mins} phút**. Hãy giữ văn minh nhé!"
+    return f"⚠️ **{user_mention}** ơi, đừng dùng từ ngữ không phù hợp nhé! *(Lần {count}/{MAX_VIOLATIONS})*"
 
 
 # ============================================================
 # CHANNEL RESTRICTION (/only)
 # ============================================================
-# Format: {guild_id: channel_id}  — mỗi server chỉ cho 1 kênh
 only_channels: dict[int, int] = {}
 
 
@@ -125,14 +115,12 @@ def save_only_config():
 
 
 def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
-    """Không có restriction → cho phép tất cả. Có → chỉ cho kênh đã set."""
     if guild_id not in only_channels:
         return True
     return only_channels[guild_id] == channel_id
 
 
 def can_manage_only(member: discord.Member) -> bool:
-    """Chỉ owner, admin, hoặc role cao hơn bot mới được dùng /only."""
     if not member.guild:
         return False
     if member.id == member.guild.owner_id:
@@ -156,7 +144,7 @@ async def is_admin_or_higher(interaction: discord.Interaction) -> bool:
 # ============================================================
 channel_themes = defaultdict(lambda: ACTIVE_THEME)
 chat_sessions = defaultdict(list)
-MAX_HISTORY = 20
+MAX_HISTORY = 12  # giảm từ 20 → 12 để gửi ít token hơn, phản hồi nhanh hơn
 
 
 def get_history(channel_id: int):
@@ -164,7 +152,8 @@ def get_history(channel_id: int):
 
 
 def add_to_history(channel_id: int, role: str, text: str):
-    chat_sessions[channel_id].append({"role": role, "parts": [{"text": text}]})
+    # Groq dùng format OpenAI: {"role": ..., "content": ...}
+    chat_sessions[channel_id].append({"role": role, "content": text})
     if len(chat_sessions[channel_id]) > MAX_HISTORY:
         chat_sessions[channel_id] = chat_sessions[channel_id][-MAX_HISTORY:]
 
@@ -174,52 +163,56 @@ def clear_history(channel_id: int):
 
 
 # ============================================================
-# GỌI GEMINI API (auto-retry)
+# GỌI GROQ API — SIÊU NHANH (0.5-1.5s)
 # ============================================================
-async def call_gemini_api(channel_id, prompt):
+async def call_ai_api(channel_id, prompt):
     theme_key = channel_themes[channel_id]
     theme = get_theme(theme_key)
 
-    url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
+    messages = [{"role": "system", "content": theme["system_prompt"]}]
+    messages.extend(get_history(channel_id))
+    messages.append({"role": "user", "content": prompt})
 
-    history = get_history(channel_id).copy()
-    history.append({"role": "user", "parts": [{"text": prompt}]})
-
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "systemInstruction": {"parts": [{"text": theme["system_prompt"]}]},
-        "contents": history,
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1024,  # giới hạn để phản hồi ngắn hơn, nhanh hơn
     }
 
     last_error = None
-    for attempt in range(3):
+    for attempt in range(2):  # chỉ retry 1 lần thay vì 3
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
+                async with session.post(
+                    GROQ_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        try:
-                            reply = data["candidates"][0]["content"]["parts"][0]["text"]
-                        except (KeyError, IndexError):
-                            raise Exception(f"Phản hồi không hợp lệ: {data}")
+                        reply = data["choices"][0]["message"]["content"]
                         add_to_history(channel_id, "user", prompt)
-                        add_to_history(channel_id, "model", reply)
+                        add_to_history(channel_id, "assistant", reply)
                         return reply
-                    elif resp.status in (503, 429):
-                        error_text = await resp.text()
-                        last_error = f"Lỗi {resp.status}: {error_text}"
-                        wait = 3 * (attempt + 1)
-                        print(f"⚠️ Lần thử {attempt + 1} gặp {resp.status}, đợi {wait}s...")
-                        await asyncio.sleep(wait)
+                    elif resp.status in (429, 503):
+                        last_error = f"Lỗi {resp.status}"
+                        await asyncio.sleep(1)  # đợi 1s thôi
                         continue
                     else:
                         error_text = await resp.text()
                         raise Exception(f"Lỗi API ({resp.status}): {error_text}")
         except aiohttp.ClientError as e:
             last_error = f"Lỗi mạng: {e}"
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             continue
 
-    raise Exception(f"Máy chủ quá tải sau 3 lần thử. Chi tiết: {last_error}")
+    raise Exception(f"API lỗi sau 2 lần thử. Chi tiết: {last_error}")
 
 
 # ============================================================
@@ -255,17 +248,13 @@ async def _reply_long(target, text: str, is_slash: bool = False):
 
 
 async def _check_channel_slash(interaction: discord.Interaction) -> bool:
-    """Kiểm tra kênh cho slash command. Trả về True nếu OK."""
     if not interaction.guild:
-        await interaction.response.send_message(
-            "❌ Bot chỉ hoạt động trong server!", ephemeral=True
-        )
+        await interaction.response.send_message("❌ Bot chỉ hoạt động trong server!", ephemeral=True)
         return False
     if not is_channel_allowed(interaction.guild_id, interaction.channel_id):
         allowed_id = only_channels.get(interaction.guild_id)
         await interaction.response.send_message(
-            f"❌ Bot chỉ hoạt động ở <#{allowed_id}>. "
-            f"Dùng `/only` ở kênh mong muốn để đổi.",
+            f"❌ Bot chỉ hoạt động ở <#{allowed_id}>. Dùng `/only` ở kênh mong muốn để đổi.",
             ephemeral=True,
         )
         return False
@@ -273,14 +262,13 @@ async def _check_channel_slash(interaction: discord.Interaction) -> bool:
 
 
 # ============================================================
-# SLASH COMMAND: /ask
+# SLASH: /ask
 # ============================================================
 @bot.tree.command(name="ask", description="Hỏi AI")
 @app_commands.describe(cau_hoi="Câu hỏi của bạn")
 async def ask(interaction: discord.Interaction, cau_hoi: str):
     if not await _check_channel_slash(interaction):
         return
-
     uid = interaction.user.id
 
     is_banned, remaining = check_ban(uid)
@@ -300,7 +288,7 @@ async def ask(interaction: discord.Interaction, cau_hoi: str):
 
     await interaction.response.defer(thinking=True)
     try:
-        reply = await call_gemini_api(interaction.channel_id, cau_hoi)
+        reply = await call_ai_api(interaction.channel_id, cau_hoi)
         await _reply_long(interaction, reply, is_slash=True)
     except Exception as e:
         await interaction.followup.send(f"❌ Lỗi: `{e}`")
@@ -314,16 +302,13 @@ async def ask_prefix(ctx: commands.Context, *, cau_hoi: str = ""):
     if not ctx.guild:
         return
     if not is_channel_allowed(ctx.guild.id, ctx.channel.id):
-        return  # im lặng
+        return
 
     uid = ctx.author.id
 
     is_banned, remaining = check_ban(uid)
     if is_banned:
-        await ctx.send(
-            f"🚫 {ctx.author.mention} đang bị tạm chặn. Còn **{remaining}s**.",
-            delete_after=10,
-        )
+        await ctx.send(f"🚫 {ctx.author.mention} đang bị tạm chặn. Còn **{remaining}s**.", delete_after=10)
         try:
             await ctx.message.delete()
         except (discord.Forbidden, discord.NotFound):
@@ -347,14 +332,14 @@ async def ask_prefix(ctx: commands.Context, *, cau_hoi: str = ""):
 
     async with ctx.typing():
         try:
-            reply = await call_gemini_api(ctx.channel.id, cau_hoi)
+            reply = await call_ai_api(ctx.channel.id, cau_hoi)
             await _reply_long(ctx, reply, is_slash=False)
         except Exception as e:
             await ctx.reply(f"❌ Lỗi: `{e}`")
 
 
 # ============================================================
-# SLASH COMMAND: /reset
+# SLASH: /reset
 # ============================================================
 @bot.tree.command(name="reset", description="Xoá lịch sử hội thoại của kênh này")
 async def reset(interaction: discord.Interaction):
@@ -366,7 +351,7 @@ async def reset(interaction: discord.Interaction):
 
 
 # ============================================================
-# SLASH COMMAND: /theme
+# SLASH: /theme
 # ============================================================
 @bot.tree.command(name="theme", description="Đổi chủ đề của bot trong kênh này")
 @app_commands.describe(ten_theme="Chọn chủ đề")
@@ -390,7 +375,7 @@ async def theme_cmd(interaction: discord.Interaction, ten_theme: app_commands.Ch
 
 
 # ============================================================
-# SLASH COMMAND: /themes
+# SLASH: /themes
 # ============================================================
 @bot.tree.command(name="themes", description="Xem danh sách chủ đề có sẵn")
 async def themes_cmd(interaction: discord.Interaction):
@@ -404,16 +389,12 @@ async def themes_cmd(interaction: discord.Interaction):
     current = channel_themes[interaction.channel_id]
     for key, t in THEMES.items():
         marker = " ✅" if key == current else ""
-        embed.add_field(
-            name=f"{t['emoji']} {t['name']}{marker}",
-            value=f"`{key}`",
-            inline=True,
-        )
+        embed.add_field(name=f"{t['emoji']} {t['name']}{marker}", value=f"`{key}`", inline=True)
     await interaction.response.send_message(embed=embed)
 
 
 # ============================================================
-# SLASH COMMAND: /only — Chỉ định kênh hoạt động
+# SLASH: /only
 # ============================================================
 @bot.tree.command(name="only", description="[Admin] Khoá bot chỉ hoạt động ở kênh này")
 @app_commands.check(is_admin_or_higher)
@@ -421,57 +402,40 @@ async def only_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Chỉ dùng trong server!", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     channel_id = interaction.channel_id
     old_channel = only_channels.get(guild_id)
-
     only_channels[guild_id] = channel_id
     save_only_config()
 
     embed = discord.Embed(
         title="🔒 Đã kích hoạt chế độ giới hạn kênh",
-        description=(
-            f"Bot giờ **chỉ hoạt động** ở kênh {interaction.channel.mention}.\n"
-            f"Các kênh khác gõ lệnh `/ask`, `!ask`, `/theme`... sẽ bị bỏ qua."
-        ),
+        description=f"Bot giờ **chỉ hoạt động** ở kênh {interaction.channel.mention}.",
         color=0xE67E22,
     )
     if old_channel and old_channel != channel_id:
-        embed.add_field(
-            name="⚠️ Thay thế kênh cũ",
-            value=f"Kênh cũ <#{old_channel}> không còn được kích hoạt.",
-            inline=False,
-        )
+        embed.add_field(name="⚠️ Thay thế kênh cũ", value=f"Kênh cũ <#{old_channel}> không còn kích hoạt.", inline=False)
     embed.set_footer(text="Dùng /only-reset để mở lại toàn bộ server.")
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="only-reset", description="[Admin] Bỏ giới hạn kênh — bot hoạt động mọi kênh")
+@bot.tree.command(name="only-reset", description="[Admin] Bỏ giới hạn kênh")
 @app_commands.check(is_admin_or_higher)
 async def only_reset(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Chỉ dùng trong server!", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     if guild_id in only_channels:
         old = only_channels.pop(guild_id)
         save_only_config()
         embed = discord.Embed(
             title="🔓 Đã bỏ giới hạn kênh",
-            description=(
-                f"Bot giờ hoạt động ở **mọi kênh** trong server.\n"
-                f"*(Trước đó chỉ kích hoạt ở <#{old}>)*"
-            ),
+            description=f"Bot giờ hoạt động ở **mọi kênh** trong server.",
             color=0x2ECC71,
         )
     else:
-        embed = discord.Embed(
-            title="ℹ️ Chưa có giới hạn nào",
-            description="Bot đang hoạt động ở mọi kênh rồi.",
-            color=0x3498DB,
-        )
+        embed = discord.Embed(title="ℹ️ Chưa có giới hạn nào", description="Bot đang hoạt động ở mọi kênh.", color=0x3498DB)
     await interaction.response.send_message(embed=embed)
 
 
@@ -481,28 +445,22 @@ async def only_status(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("❌ Chỉ dùng trong server!", ephemeral=True)
         return
-
     guild_id = interaction.guild_id
     embed = discord.Embed(title="📊 Trạng thái /only", color=0x3498DB)
-
     if guild_id in only_channels:
         channel_id = only_channels[guild_id]
         channel = interaction.guild.get_channel(channel_id)
         if channel:
             embed.description = f"🔒 Bot **chỉ hoạt động** ở kênh {channel.mention}"
         else:
-            embed.description = (
-                f"⚠️ Kênh cũ (ID: `{channel_id}`) đã bị xoá!\n"
-                f"Dùng `/only` ở kênh mới hoặc `/only-reset` để fix."
-            )
+            embed.description = f"⚠️ Kênh cũ (ID: `{channel_id}`) đã bị xoá!"
     else:
         embed.description = "🔓 Bot hoạt động ở **mọi kênh** trong server"
-
     await interaction.response.send_message(embed=embed)
 
 
 # ============================================================
-# ON_MESSAGE: mention / reply
+# ON_MESSAGE
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -511,13 +469,11 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    # Bỏ qua tin nhắn là prefix command (đã xử lý ở trên)
     prefix = bot.command_prefix
     prefixes = prefix if isinstance(prefix, (list, tuple)) else [prefix]
     if any(message.content.startswith(p) for p in prefixes):
         return
 
-    # Chỉ phản hồi nếu mention hoặc reply bot
     is_mentioned = bot.user in message.mentions
     is_reply_to_bot = (
         message.reference
@@ -528,7 +484,6 @@ async def on_message(message: discord.Message):
     if not (is_mentioned or is_reply_to_bot):
         return
 
-    # Check channel restriction (im lặng)
     if message.guild and not is_channel_allowed(message.guild.id, message.channel.id):
         return
 
@@ -545,9 +500,7 @@ async def on_message(message: discord.Message):
 
     is_banned, remaining = check_ban(uid)
     if is_banned:
-        await message.reply(
-            f"🚫 Bạn đang bị tạm chặn. Còn **{remaining}s** nữa.", delete_after=10
-        )
+        await message.reply(f"🚫 Bạn đang bị tạm chặn. Còn **{remaining}s**.", delete_after=10)
         return
 
     bad = find_bad_word(content)
@@ -563,7 +516,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply = await call_gemini_api(message.channel.id, content)
+            reply = await call_ai_api(message.channel.id, content)
             await _reply_long(message, reply, is_slash=False)
         except Exception as e:
             await message.reply(f"❌ Lỗi: `{e}`")
@@ -577,25 +530,20 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CheckFailure):
         try:
             await interaction.response.send_message(
-                "❌ Bạn không có quyền dùng lệnh này! "
-                "Chỉ role cao hơn bot hoặc admin mới dùng được.",
-                ephemeral=True,
-            )
-        except discord.InteractionResponded:
-            await interaction.followup.send(
                 "❌ Bạn không có quyền dùng lệnh này!", ephemeral=True
             )
+        except discord.InteractionResponded:
+            await interaction.followup.send("❌ Bạn không có quyền dùng lệnh này!", ephemeral=True)
         return
     print(f"⚠️ Command error: {error}")
 
 
 # ============================================================
-# READY EVENT
+# READY
 # ============================================================
 @bot.event
 async def on_ready():
     load_only_config()
-
     try:
         synced = await bot.tree.sync()
         print(f"✅ Đã đồng bộ {len(synced)} slash command.")
@@ -604,13 +552,11 @@ async def on_ready():
 
     theme = get_theme()
     print(f"🤖 Bot online: {bot.user} (ID: {bot.user.id})")
+    print(f"⚡ AI: Groq ({GROQ_MODEL})")
     print(f"🎨 Theme mặc định: {theme['name']}")
-    print(f"🛡️ Filter bậy: {len(BAD_WORDS)} từ | Ban tạm: {BAN_DURATION // 60} phút / {MAX_VIOLATIONS} lần")
-    print(f"🔒 Giới hạn kênh: {len(only_channels)} server đang bật /only")
+    print(f"🛡️ Filter bậy: {len(BAD_WORDS)} từ | Ban: {BAN_DURATION // 60} phút / {MAX_VIOLATIONS} lần")
 
-    await bot.change_presence(
-        activity=discord.Game(name=f"{theme['emoji']} /ask hoặc !ask")
-    )
+    await bot.change_presence(activity=discord.Game(name=f"{theme['emoji']} /ask hoặc !ask"))
 
 
 # ============================================================
@@ -618,14 +564,4 @@ async def on_ready():
 # ============================================================
 try:
     from werewolf import setup_werewolf
-    setup_werewolf(bot)
-    print("✅ Đã load game Ma Sói.")
-except ImportError:
-    print("⚠️ Không tìm thấy werewolf.py — bỏ qua game Ma Sói.")
-
-
-# ============================================================
-# CHẠY BOT
-# ============================================================
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    setup_werewolf(bot
